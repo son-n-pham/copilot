@@ -3,7 +3,7 @@ Open https://copilot.cloud.microsoft/?fromCode=cmcv2&redirectId=079013B7710342F5
 
 Behavior:
 - headless = False
-- browser executable: C:\\Program Files\\Google\\Chrome Dev\\Application\\chrome.exe
+- browser executable: C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe
 - user data dir: %USERPROFILE%\\AppData\\Local\\Microsoft\\Playwright\\mcp-user-data
 - If login is required, you can log in manually; the session will persist for next runs.
 - The page stays open until you confirm shutdown in the terminal.
@@ -19,20 +19,30 @@ import re
 from playwright.sync_api import BrowserContext, Error, Page, sync_playwright
 
 
-TARGET_URL = "https://copilot.cloud.microsoft/?fromCode=cmcv2&redirectId=079013B7710342F5A1FDB755834168FD&auth=2"
-# CHROME_EXE = r"C:\\Program Files\\Google\\Chrome Dev\\Application\\chrome.exe"
+TARGET_URL = "https://copilot.microsoft.com/chats"
 CHROME_EXE = r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-USER_DATA_DIR_ENV = r"C:\\Users\\phamsonn\\AppData\\Local\\Microsoft\\Playwright\\codes"
+# Use absolute path to avoid issues
+USER_DATA_DIR_ENV = os.path.expanduser(
+    r"~\AppData\Local\Microsoft\Playwright\mcp-user-data")
+
+
+def ensure_dir(path: str) -> None:
+    """Ensure the directory exists, handling permission errors gracefully."""
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print(f"[ERROR] Permission denied creating directory: {path}")
+        print("[INFO] Try running as administrator or choose a different directory.")
+        sys.exit(1)
+    except OSError as e:
+        print(f"[ERROR] Failed to create directory {path}: {e}")
+        sys.exit(1)
 
 
 def expand_windows_path(path_with_env: str) -> str:
     """Expand %VARS% and normalize Windows path separators."""
     expanded = os.path.expandvars(path_with_env)
     return os.path.normpath(expanded)
-
-
-def ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
 
 
 def has_existing_profile(user_data_dir: str) -> bool:
@@ -48,11 +58,11 @@ def has_existing_profile(user_data_dir: str) -> bool:
 
 
 def launch_context(user_data_dir: str) -> BrowserContext:
-    # Validate Chrome Dev path
+    # Validate Chrome path
     if not Path(CHROME_EXE).exists():
         print(
-            "[ERROR] Chrome Dev executable not found at: " + CHROME_EXE,
-            "\nPlease install Google Chrome Dev or update CHROME_EXE in this script.",
+            "[ERROR] Chrome executable not found at: " + CHROME_EXE,
+            "\nPlease install Google Chrome or update CHROME_EXE in this script.",
             sep="",
             file=sys.stderr,
         )
@@ -61,19 +71,37 @@ def launch_context(user_data_dir: str) -> BrowserContext:
     print(f"[INFO] Using user data dir: {user_data_dir}")
     print(f"[INFO] Using Chrome executable: {CHROME_EXE}")
 
+    # Ensure user data directory exists
+    ensure_dir(user_data_dir)
+
     ctx: BrowserContext
     with sync_playwright() as p:
         # launch_persistent_context returns a Context that stays alive while this process runs.
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=False,
-            executable_path=CHROME_EXE,
-            args=[
-                "--disable-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
+        try:
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=False,
+                executable_path=CHROME_EXE,
+                args=[
+                    "--disable-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-extensions",
+                    "--disable-web-security",
+                    "--allow-running-insecure-content",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
+        except Error as e:
+            print(f"[ERROR] Failed to launch browser context: {e}")
+            print("[INFO] Troubleshooting tips:")
+            print("  1. Close all Chrome instances and try again")
+            print("  2. Try running as administrator")
+            print("  3. Delete the user data directory and start fresh")
+            print(f"     rmdir /s \"{user_data_dir}\"")
+            sys.exit(1)
 
         # Ensure we have at least one page
         page: Page
@@ -120,7 +148,15 @@ def launch_context(user_data_dir: str) -> BrowserContext:
         try:
             # Simple REPL to keep process alive and allow future extension.
             while True:
-                cmd = input("command> ").strip().lower()
+                try:
+                    cmd = input("command> ").strip().lower()
+                except EOFError:
+                    print("\n[INFO] EOF received. Shutting down...")
+                    break
+                except KeyboardInterrupt:
+                    print("\n[INFO] Ctrl+C received. Shutting down...")
+                    break
+
                 if cmd in {"exit", "quit", "q"}:
                     break
                 elif cmd in {"help", "h", "?"}:
@@ -158,29 +194,51 @@ def launch_context(user_data_dir: str) -> BrowserContext:
                     except Exception:
                         print("[INFO] Current URL: <unknown>")
                 elif cmd == "input":
-                    prompt_text = input("Enter text prompt: ").strip()
-                    selector = input("Enter selector for text box: ").strip()
-                    if prompt_text and selector:
-                        input_prompt_into_text_box(page, prompt_text, selector)
-                    else:
-                        print("[WARN] Both prompt and selector are required.")
+                    try:
+                        prompt_text = input("Enter text prompt: ").strip()
+                        selector = input(
+                            "Enter selector for text box [default: role=combobox[name=\"Chat Input\"]]: ").strip()
+                        if not selector:
+                            selector = 'role=combobox[name="Chat Input"]'
+                        if prompt_text and selector:
+                            input_prompt_into_text_box(
+                                page, prompt_text, selector)
+                        else:
+                            print("[WARN] Both prompt and selector are required.")
+                    except EOFError:
+                        print(
+                            "\n[INFO] EOF received during input. Returning to command prompt...")
+                        continue
                 elif cmd == "upload":
-                    file_names_input = input(
-                        "Enter file names (comma-separated): "
-                    ).strip()
-                    if file_names_input:
-                        file_list = [
-                            name.strip() for name in file_names_input.split(",")
-                        ]
-                        upload_files_from_copilot_folder(page, file_list)
-                    else:
-                        print("[WARN] File names are required.")
+                    try:
+                        file_names_input = input(
+                            "Enter file names (comma-separated): "
+                        ).strip()
+                        if file_names_input:
+                            file_list = [
+                                name.strip() for name in file_names_input.split(",")
+                            ]
+                            upload_files_from_copilot_folder(page, file_list)
+                        else:
+                            print("[WARN] File names are required.")
+                    except EOFError:
+                        print(
+                            "\n[INFO] EOF received during input. Returning to command prompt...")
+                        continue
                 elif cmd == "click":
-                    selector = input("Enter selector for button: ").strip()
-                    if selector:
-                        click_button(page, selector)
-                    else:
-                        print("[WARN] Button selector is required.")
+                    try:
+                        selector = input(
+                            "Enter selector for button [default: role=button[name=\"Send\"]]: ").strip()
+                        if not selector:
+                            selector = 'role=button[name="Send"]'
+                        if selector:
+                            click_button(page, selector)
+                        else:
+                            print("[WARN] Button selector is required.")
+                    except EOFError:
+                        print(
+                            "\n[INFO] EOF received during input. Returning to command prompt...")
+                        continue
                 else:
                     if cmd:
                         print("Unknown command. Type 'help' for options.")
@@ -260,7 +318,8 @@ def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
 
         # Enter the target folder 'copilot' with exact match
         try:
-            frame.get_by_role("link", name=re.compile(r"^copilot$", re.I)).click()
+            frame.get_by_role("link", name=re.compile(
+                r"^copilot$", re.I)).click()
             print("[INFO] Entered 'copilot' folder.")
         except Error as e:
             print(f"[ERROR] Couldn't enter 'copilot' folder: {e}")
@@ -324,7 +383,6 @@ def retrieve_response(page: Page, selector: str) -> str:
 
 def main() -> None:
     user_data_dir = expand_windows_path(USER_DATA_DIR_ENV)
-    ensure_dir(user_data_dir)
 
     # Log whether we expect an existing login session
     if has_existing_profile(user_data_dir):
