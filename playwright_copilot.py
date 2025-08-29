@@ -18,6 +18,7 @@ import re
 import time
 
 import subprocess
+import base64
 from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Error, Locator, Page, sync_playwright
@@ -27,6 +28,7 @@ TARGET_URL = "https://copilot.cloud.microsoft/?fromCode=cmcv2&redirectId=079013B
 CHROME_EXE = r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 # USER_DATA_DIR_ENV = r"C:\\Users\\phamsonn\\AppData\\Local\\Microsoft\\Playwright\\codes"
 USER_DATA_DIR_ENV = r".\\.Playwright\\codes"
+DOWNLOADS_DIR = r".\\.Playwright\\downloads"
 
 # Default selectors from selectors_reference.md
 DEFAULT_TEXT_INPUT_SELECTOR = 'role=combobox[name="Chat Input"]'
@@ -55,7 +57,9 @@ def has_existing_profile(user_data_dir: str) -> bool:
         return False
 
 
-def launch_context(user_data_dir: str) -> BrowserContext:
+def launch_context(
+    user_data_dir: str, downloads_dir: str | None = None
+) -> BrowserContext:
     # Validate Chrome Dev path
     if not Path(CHROME_EXE).exists():
         print(
@@ -68,6 +72,8 @@ def launch_context(user_data_dir: str) -> BrowserContext:
 
     print(f"[INFO] Using user data dir: {user_data_dir}")
     print(f"[INFO] Using Chrome executable: {CHROME_EXE}")
+    if downloads_dir:
+        print(f"[INFO] Downloads will be saved to: {downloads_dir}")
 
     ctx: BrowserContext
     with sync_playwright() as p:
@@ -81,6 +87,8 @@ def launch_context(user_data_dir: str) -> BrowserContext:
                 "--no-first-run",
                 "--no-default-browser-check",
             ],
+            accept_downloads=True,
+            downloads_path=downloads_dir,
         )
 
         # Ensure we have at least one page
@@ -185,6 +193,15 @@ def launch_context(user_data_dir: str) -> BrowserContext:
                         print("\n----- COPILOT RESPONSE -----")
                         print(copied)
                         print("----- END RESPONSE -----\n")
+
+                        # Auto-download any blob attachments in the latest message
+                        try:
+                            if downloads_dir:
+                                download_blob_links_from_latest_message(
+                                    page, downloads_dir
+                                )
+                        except Exception as e:
+                            print(f"[WARN] Auto-download failed: {e}")
                     except Exception as e:
                         print(f"[ERROR] Failed to retrieve response: {e}")
                 elif cmd == "refresh":
@@ -234,7 +251,7 @@ def launch_context(user_data_dir: str) -> BrowserContext:
                     if not selector:
                         selector = DEFAULT_SEND_BUTTON_SELECTOR
                     if selector:
-                        click_button(page, selector)
+                        click_button(page, selector, downloads_dir)
                     else:
                         print("[WARN] Button selector is required.")
                 else:
@@ -276,6 +293,12 @@ def _copy_button_in_message(message_locator: Locator) -> Locator:
     return message_locator.locator(
         "[data-testid='CopyButtonTestId'], [data-testid='CopyButtonTestID'], button[aria-label='Copy'], [aria-label='Copy'][role='button']"
     )
+
+
+def _blob_links_in_message(message_locator: Locator) -> Locator:
+    """Anchors that look like downloadable blob attachments within a message."""
+    # Be permissive: some messages omit the download attribute.
+    return message_locator.locator("a[href^='blob:'], a[download][href*='blob:']")
 
 
 # Count all chat questions; also return the locator
@@ -614,7 +637,7 @@ def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
         print(f"[ERROR] Failed to confirm selection: {e}")
 
 
-def click_button(page: Page, selector: str) -> None:
+def click_button(page: Page, selector: str, downloads_dir: str | None = None) -> None:
     """Helper to click a button identified by the selector."""
     print(f"[DEBUG] Clicking button with selector '{selector}'")
     try:
@@ -652,10 +675,224 @@ def click_button(page: Page, selector: str) -> None:
                 print("\n----- COPILOT RESPONSE -----")
                 print(response_text or "No response retrieved")
                 print("----- END RESPONSE -----\n")
+
+                # Auto-download any blob attachments in the latest message
+                try:
+                    if downloads_dir:
+                        download_blob_links_from_latest_message(page, downloads_dir)
+                except Exception as e:
+                    print(f"[WARN] Auto-download failed: {e}")
             except Exception as e:
                 print(f"[ERROR] Failed to retrieve response: {e}")
     except Error as e:
         print(f"[ERROR] Failed to click button: {e}")
+
+
+def download_blob_links_from_latest_message(page: Page, download_dir: str) -> list[str]:
+    """
+    Detects blob: download links in the last Copilot message and saves them.
+    Returns a list of saved file paths.
+    """
+    saved: list[str] = []
+
+    msg_count, msgs = count_return_copilot_messages(page)
+    if msg_count < 1:
+        return saved
+
+    last_msg = msgs.nth(msg_count - 1)
+    try:
+        last_msg.scroll_into_view_if_needed(timeout=3000)
+    except Error:
+        pass
+
+    anchors = _blob_links_in_message(last_msg)
+    try:
+        anchors.first.wait_for(state="attached", timeout=5_000)
+    except Error:
+        pass
+
+    try:
+        total = anchors.count()
+    except Error:
+        total = 0
+
+    # Fallback 1: role-based "Download …" link inside the last message
+    if total == 0:
+        try:
+            dl_links = last_msg.get_by_role(
+                "link", name=re.compile(r"^Download\b", re.I)
+            )
+            # Ensure these links really point to a blob:
+            # filter by href^='blob:' where possible
+            # (Playwright's .filter() can't inspect attributes directly; check via count loop below)
+            total = dl_links.count()
+            if total > 0:
+                # Replace anchors with only those that have blob: href
+                blob_indices: list[int] = []
+                for i in range(total):
+                    try:
+                        href = dl_links.nth(i).get_attribute("href")
+                        if href and href.startswith("blob:"):
+                            blob_indices.append(i)
+                    except Error:
+                        continue
+                if blob_indices:
+                    # Build a locator that is a union of the qualifying nth() targets.
+                    # Iterate directly using the stored indices.
+                    anchors = dl_links  # reuse; we'll use nth() with blob_indices below
+                    total = len(blob_indices)
+                else:
+                    total = 0
+                    anchors = last_msg.locator(
+                        "a[href^='blob:']"
+                    )  # keep a sane default
+        except Error:
+            pass
+
+    # Fallback 2: page-wide blob links (take the most recent ones)
+    global_blob_indices: list[int] | None = None
+    global_anchors: Locator | None = None
+    if total == 0:
+        try:
+            global_anchors = page.locator(
+                "a[href^='blob:'], a[download][href*='blob:']"
+            )
+            try:
+                global_anchors.first.wait_for(state="attached", timeout=3_000)
+            except Error:
+                pass
+            g_total = global_anchors.count()
+            if g_total > 0:
+                # Use them as a last-resort; prefer the last ones (end of DOM order)
+                total = g_total
+                # We'll iterate over all, but start from the end
+                global_blob_indices = list(range(g_total))
+        except Error:
+            pass
+
+    if total == 0:
+        print("[INFO] No blob attachments found in latest message.")
+        return saved
+
+    ensure_dir(download_dir)
+    print(f"[INFO] Found {total} blob attachment(s); downloading to '{download_dir}'…")
+
+    def save_via_download_api(click_target: Locator, fallback_name: str) -> str | None:
+        # Context-level (captures new tab) then page-level
+        # 1) BrowserContext-level
+        try:
+            with page.context.expect_event("download", timeout=20_000) as dl_info:
+                click_target.click()
+            dl = dl_info.value
+            name = (
+                dl.suggested_filename
+                if getattr(dl, "suggested_filename", None)
+                else fallback_name
+            )
+            path = os.path.join(download_dir, name)
+            dl.save_as(path)
+            return path
+        except Error:
+            pass
+        # 2) Page-level
+        try:
+            with page.expect_download(timeout=15_000) as dl_info:
+                click_target.click()
+            dl = dl_info.value
+            name = (
+                dl.suggested_filename
+                if getattr(dl, "suggested_filename", None)
+                else fallback_name
+            )
+            path = os.path.join(download_dir, name)
+            dl.save_as(path)
+            return path
+        except Error:
+            return None
+
+    def save_via_fetch(href: str, fallback_name: str) -> str | None:
+        try:
+            b64 = page.evaluate(
+                """
+                async (blobHref) => {
+                    const res = await fetch(blobHref);
+                    if (!res.ok) throw new Error('Fetch failed: ' + res.status);
+                    const buf = await res.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    const chunk = 0x8000;
+                    let binary = '';
+                    for (let i = 0; i < bytes.length; i += chunk) {
+                        const slice = bytes.subarray(i, i + chunk);
+                        binary += String.fromCharCode.apply(null, slice);
+                    }
+                    return btoa(binary);
+                }
+                """,
+                href,
+            )
+            data = base64.b64decode(b64)
+            target_path = os.path.join(download_dir, fallback_name)
+            with open(target_path, "wb") as f:
+                f.write(data)
+            return target_path
+        except Exception as e:
+            print(f"[ERROR] Fetch fallback failed: {e}")
+            return None
+
+    # Iterate message-local anchors first, else global anchors
+    if global_blob_indices is None:
+        # We're using message-local anchors (anchors may be last_msg.locator(...) or dl_links)
+        count_local = anchors.count()
+        for i in range(count_local):
+            link = anchors.nth(i)
+            try:
+                filename = link.get_attribute("download") or f"copilot_download_{i}.bin"
+            except Error:
+                filename = f"copilot_download_{i}.bin"
+
+            saved_path = save_via_download_api(link, filename)
+            if not saved_path:
+                # Fetch fallback
+                try:
+                    href = link.get_attribute("href")
+                except Error:
+                    href = None
+                if href and href.startswith("blob:"):
+                    saved_path = save_via_fetch(href, filename)
+
+            if saved_path:
+                print(f"[INFO] Saved: {saved_path}")
+                saved.append(saved_path)
+            else:
+                print(f"[WARN] Failed to save attachment #{i + 1}")
+    else:
+        # Page-wide fallback iteration (from newest-looking to oldest)
+        for idx in reversed(global_blob_indices):
+            link = global_anchors.nth(idx)  # type: ignore[arg-type]
+            try:
+                filename = (
+                    link.get_attribute("download") or f"copilot_download_{idx}.bin"
+                )
+            except Error:
+                filename = f"copilot_download_{idx}.bin"
+
+            saved_path = save_via_download_api(link, filename)
+            if not saved_path:
+                # Fetch fallback
+                try:
+                    href = link.get_attribute("href")
+                except Error:
+                    href = None
+                if href and href.startswith("blob:"):
+                    saved_path = save_via_fetch(href, filename)
+
+            if saved_path:
+                print(f"[INFO] Saved: {saved_path}")
+                saved.append(saved_path)
+            else:
+                print(f"[WARN] Failed to save fallback attachment #{idx + 1}")
+
+    return saved
 
 
 def wait_for_copy_button_on_last_message(
@@ -812,7 +1049,9 @@ def retrieve_latest_response(page: Page) -> str:
 
 def main() -> None:
     user_data_dir = expand_windows_path(USER_DATA_DIR_ENV)
+    downloads_dir = expand_windows_path(DOWNLOADS_DIR)
     ensure_dir(user_data_dir)
+    ensure_dir(downloads_dir)
 
     # Log whether we expect an existing login session
     if has_existing_profile(user_data_dir):
@@ -822,7 +1061,7 @@ def main() -> None:
     else:
         print("[INFO] No existing profile data found; a fresh profile will be created.")
 
-    launch_context(user_data_dir)
+    launch_context(user_data_dir, downloads_dir)
 
 
 if __name__ == "__main__":
