@@ -13,15 +13,22 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 import re
 import time
-
-import subprocess
 import base64
+import subprocess
+import functools
+from pathlib import Path
 from urllib.parse import urlparse
+from typing import Callable, Any, TypeVar, Optional
 
-from playwright.sync_api import BrowserContext, Error, Locator, Page, sync_playwright
+from playwright.sync_api import (
+    BrowserContext,
+    Page,
+    Locator,
+    Error,
+    sync_playwright,
+)
 
 TARGET_URL = "https://copilot.cloud.microsoft/?fromCode=cmcv2&redirectId=079013B7710342F5A1FDB755834168FD&auth=2"
 # CHROME_EXE = r"C:\\Program Files\\Google\\Chrome Dev\\Application\\chrome.exe"
@@ -350,8 +357,6 @@ def wait_for_latest_copilot_message_fully_generated(
     return False
 
 
-# ...existing code...
-# ...existing code...
 def _read_clipboard_quick(page: Page) -> str | None:
     """Quick clipboard reading with single attempt."""
     # Try web clipboard API first
@@ -384,6 +389,116 @@ def _read_clipboard_quick(page: Page) -> str | None:
         pass
 
     return None
+
+
+T = TypeVar("T")
+
+
+def wait_for_element(
+    timeout: int = 15000,
+    check_states: list[str] = ["visible", "stable", "enabled"],
+    retry_interval: int = 500,
+    max_retries: int = 3,
+    description: Optional[str] = None,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator that ensures elements are fully ready before interaction.
+
+    Args:
+        timeout: Max wait time in ms for each state check
+        check_states: List of element states to check ("visible", "stable", "enabled")
+        retry_interval: Time in ms between retries
+        max_retries: Maximum number of action retries
+        description: Optional description for logging
+    """
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            # Get page and locator from arguments
+            page = None
+            locator = None
+
+            # Find page and locator in args
+            for arg in args:
+                if isinstance(arg, Page):
+                    page = arg
+                elif isinstance(arg, Locator):
+                    locator = arg
+
+            # If first arg is page and we have a get_by_* function call
+            if (
+                page
+                and not locator
+                and len(args) >= 2
+                and callable(getattr(page, func.__name__, None))
+            ):
+                # This is a page.get_by_* method call, so we need to get the locator first
+                try:
+                    # Call the original method to get the locator
+                    get_method = getattr(page, func.__name__)
+                    selector_args = args[1:]  # Skip the page argument
+                    selector_kwargs = kwargs.copy()
+                    locator = get_method(*selector_args, **selector_kwargs)
+
+                    # Now we need to determine the action
+                    # If it ends with .click(), it's a click action
+                    if func.__name__ == "click":
+                        action = "click"
+                    else:
+                        action = func.__name__
+                except Exception:
+                    # Fall back to original function if we can't determine the action
+                    return func(*args, **kwargs)
+
+            action_name = description or func.__name__
+
+            if not page or not locator:
+                # If we couldn't identify both page and locator, just call the original function
+                return func(*args, **kwargs)
+
+            # Wait for all specified states
+            for state in check_states:
+                try:
+                    print(
+                        f"[WAIT] Waiting for element to be {state} before {action_name}..."
+                    )
+                    locator.wait_for(state=state, timeout=timeout)
+                except Error as e:
+                    print(f"[WARN] Element not {state} within timeout: {e}")
+                    # Continue with other states rather than failing immediately
+
+            # Try the action with retries
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        print(
+                            f"[RETRY] Attempt {attempt + 1}/{max_retries} for {action_name}"
+                        )
+                    return func(*args, **kwargs)
+                except Error as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        print(
+                            f"[WARN] {action_name} failed (attempt {attempt + 1}): {e}"
+                        )
+                        # Exponential backoff
+                        time.sleep(retry_interval * (2**attempt) / 1000)
+
+            # If we got here, all retries failed
+            if last_error:
+                print(
+                    f"[ERROR] {action_name} failed after {max_retries} attempts: {last_error}"
+                )
+                raise last_error
+
+            # Should never get here, but just in case
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def copy_latest_copilot_message_quick(page: Page) -> str | None:
@@ -552,63 +667,75 @@ def input_prompt_into_text_box(page: Page, prompt: str, selector: str) -> None:
 
 
 def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
-    """Attach cloud files via the Microsoft 365 Copilot file picker (Steps 4–6).
-
-    Implements:
-      - Step 4: Open "Add content and agents" > "Attach cloud files".
-      - Step 5: Enter File Picker iframe, click "My files", then open the "copilot" folder.
-      - Step 6: Select all files whose names are provided in file_list, then click "Select".
-
-    Notes:
-      - Uses role-based selectors for reliability.
-      - Uses regex for partial name matching of file checkboxes.
-    """
+    """Attach cloud files via the Microsoft 365 Copilot file picker."""
 
     # Step 4: Access file upload interface
     try:
         print("[INFO] Opening 'Add content and agents' menu…")
-        page.get_by_role("button", name="Add content and agents").click()
+
+        # Apply decorator to locator methods directly
+        click_button = wait_for_element(description="PlusMenuButton click")(
+            lambda p: p.get_by_test_id("PlusMenuButton").click()
+        )
+        click_button(page)
+
+        click_add_content = wait_for_element(description="Add content click")(
+            lambda p: p.get_by_text("Add content").click()
+        )
+        click_add_content(page)
+
+        click_upload = wait_for_element(description="upload-cloud-file click")(
+            lambda p: p.get_by_test_id("upload-cloud-file").click()
+        )
+        click_upload(page)
+
     except Error as e:
         print(f"[ERROR] Couldn't open 'Add content and agents': {e}")
-        return
-
-    try:
-        print("[INFO] Choosing 'Attach cloud files'…")
-        page.get_by_role("button", name="Attach cloud files").click()
-    except Error as e:
-        print(f"[ERROR] Couldn't click 'Attach cloud files': {e}")
         return
 
     # Step 5: Navigate SharePoint/OneDrive file picker (iframe)
     try:
         print("[INFO] Waiting for File Picker iframe…")
-        iframe_el = page.wait_for_selector(
-            'iframe[title="File Picker"]', state="visible", timeout=30000
-        )
+        # The iframe selector needs special handling - we need to wait for it properly
+        wait_for_iframe = wait_for_element(
+            timeout=30000, check_states=["visible"], description="File Picker iframe"
+        )(lambda p: p.wait_for_selector('iframe[title="File Picker"]'))
+
+        iframe_el = wait_for_iframe(page)
         frame = iframe_el.content_frame() if iframe_el else None
+
         if frame is None:
             print(
                 "[ERROR] File Picker iframe frame not available (content_frame() returned None)."
             )
             return
 
-        # Click "My files" if present (some contexts default here already)
+        # Click "My files" if present - no need for is_visible check as the decorator will handle it
         try:
-            my_files_btn = frame.get_by_role("button", name="My files")
-            if my_files_btn.is_visible():
-                my_files_btn.click()
-                print("[INFO] Clicked 'My files'.")
+            click_my_files = wait_for_element(
+                check_states=["visible", "enabled"], description="My files button"
+            )(lambda f: f.get_by_role("button", name="My files").click())
+
+            click_my_files(frame)
+            print("[INFO] Clicked 'My files'.")
         except Error:
             # Best-effort: continue if not present
             print("[DEBUG] 'My files' button not visible; proceeding.")
 
         # Enter the target folder 'copilot' with exact match
         try:
-            frame.get_by_role("link", name=re.compile(r"^copilot$", re.I)).click()
+            click_copilot_folder = wait_for_element(description="copilot folder link")(
+                lambda f: f.get_by_role(
+                    "link", name=re.compile(r"^copilot$", re.I)
+                ).click()
+            )
+
+            click_copilot_folder(frame)
             print("[INFO] Entered 'copilot' folder.")
         except Error as e:
             print(f"[ERROR] Couldn't enter 'copilot' folder: {e}")
             return
+
     except Error as e:
         print(f"[ERROR] File Picker not available: {e}")
         return
@@ -619,8 +746,12 @@ def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
         # Use partial name matching (case-insensitive)
         pattern = re.compile(re.escape(file_name), re.I)
         try:
-            checkbox = frame.get_by_role("checkbox", name=pattern)
-            checkbox.click()
+            # Create a dynamic click function for each file checkbox
+            click_checkbox = wait_for_element(
+                description=f"file checkbox '{file_name}'"
+            )(lambda f, pat=pattern: f.get_by_role("checkbox", name=pat).click())
+
+            click_checkbox(frame)
             print(f"[INFO] Selected file checkbox matching: '{file_name}'.")
             any_selected = True
         except Error as e:
@@ -631,7 +762,12 @@ def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
         return
 
     try:
-        frame.get_by_role("button", name=re.compile(r"^Select$", re.I)).click()
+        # Click the Select button with decorator
+        click_select_button = wait_for_element(
+            description="Select confirmation button"
+        )(lambda f: f.get_by_role("button", name=re.compile(r"^Select$", re.I)).click())
+
+        click_select_button(frame)
         print("[INFO] Confirmed selection by clicking 'Select'.")
     except Error as e:
         print(f"[ERROR] Failed to confirm selection: {e}")
