@@ -657,11 +657,16 @@ def copy_latest_copilot_message(page: Page) -> str | None:
 
 
 def input_prompt_into_text_box(page: Page, prompt: str, selector: str) -> None:
-    """Helper to input text into a page element."""
-    print(f"[DEBUG] Inputting prompt into selector '{selector}'")
+    """Helper to input text into a page element, then append a spacebar keystroke."""
+    print(f"[DEBUG] Inputting prompt into selector '{selector}' and appending spacebar")
     try:
-        page.fill(selector, prompt)
-        print(f"[INFO] Successfully inputted text into '{selector}'")
+        tb = page.locator(selector)
+        tb.wait_for(state="visible", timeout=10_000)
+        tb.click()  # focus the input
+        # Avoid duplicating spaces if caller already provided trailing whitespace
+        tb.fill(prompt.rstrip())
+        tb.press("Space")  # append a real spacebar keystroke
+        print(f"[INFO] Successfully inputted text and pressed Space in '{selector}'")
     except Error as e:
         print(f"[ERROR] Failed to input text: {e}")
 
