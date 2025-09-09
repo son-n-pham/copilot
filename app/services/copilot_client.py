@@ -58,7 +58,7 @@ class CopilotClient:
         self.text_input_selector = 'role=combobox[name="Chat Input"]'
         self.send_button_selector = 'role=button[name="Send"]'
         self.copilot_message_selector = '[data-testid="copilot-message-div"]'
-        self.copy_button_selector = '[data-testid="CopyButtonTestId"], [data-testid="CopyButtonTestID"], button[aria-label="Copy"]'
+        self.copy_button_selector = '[data-testid="CopyButtonTestId"], [data-testid="CopyButtonTestID"], button[aria-label="Copy"], [aria-label="Copy"][role="button"]'
 
         # Persistent session variables
         self.playwright = None
@@ -350,38 +350,114 @@ class CopilotClient:
     async def _wait_for_response(
         self, page: Page, initial_message_count: int, timeout: int = 120
     ) -> bool:
-        """Wait for Copilot to generate a response."""
-        deadline = time.time() + timeout
+        """
+        Waits for a response, trying the copy button first, then falling back to stability.
+        """
+        logger.info("Waiting for Copilot response...")
 
-        # First, wait for a new message container to appear
+        # Try waiting for the copy button with a shorter timeout
+        copy_button_visible = await self._wait_for_copy_button_on_last_message_async(
+            page, initial_message_count, timeout_s=45
+        )
+        if copy_button_visible:
+            logger.info("Copy button detected. Response is complete.")
+            return True
+
+        # Fallback to waiting for content to stabilize
+        logger.info("Copy button not found, falling back to content stability check.")
+        stabilized = await self._wait_for_response_to_stabilize_async(
+            page, initial_message_count, timeout_s=timeout, stability_period_s=3.0
+        )
+        if stabilized:
+            logger.info("Response content has stabilized.")
+            return True
+
+        logger.error(f"Response did not complete within {timeout}s.")
+        return False
+
+    async def _wait_for_copy_button_on_last_message_async(
+        self, page: Page, pre_response_msg_count: int, timeout_s: int = 45
+    ) -> bool:
+        """
+        Async: Waits for a new message and its Copy button to become visible.
+        """
+        deadline = time.time() + timeout_s
         try:
             await page.wait_for_function(
-                f"document.querySelectorAll('[data-testid=\"copilot-message-div\"]').length > {initial_message_count}",
-                timeout=min(15_000, timeout * 1000),
+                f"document.querySelectorAll('{self.copilot_message_selector}').length > {pre_response_msg_count}",
+                timeout=min(15_000, timeout_s * 1000),
             )
         except Error:
-            # Check if we actually got a new message
-            current_messages = await page.locator(self.copilot_message_selector).count()
-            if current_messages <= initial_message_count:
+            current_count = await page.locator(self.copilot_message_selector).count()
+            if current_count <= pre_response_msg_count:
                 return False
 
-        # Then wait for the response to be complete (copy button appears)
         while time.time() < deadline:
             try:
-                messages = page.locator(self.copilot_message_selector)
-                last_message = messages.last
-                copy_button = last_message.locator(self.copy_button_selector).first
-
-                # Check if copy button is visible (indicates response is complete)
-                if await copy_button.is_visible():
-                    return True
-
+                last_msg = page.locator(self.copilot_message_selector).last
+                await last_msg.scroll_into_view_if_needed(timeout=1000)
+                copy_btn = last_msg.locator(self.copy_button_selector).first
+                await copy_btn.wait_for(state="visible", timeout=1000)
+                return True
             except Error:
-                pass
+                await asyncio.sleep(0.3)
+        return False
 
-            # Wait a bit before checking again
+    async def _wait_for_response_to_stabilize_async(
+        self,
+        page: Page,
+        pre_response_msg_count: int,
+        timeout_s: int = 60,
+        stability_period_s: float = 2.0,
+    ) -> bool:
+        """
+        Async: Waits for a new message and for its content to stabilize.
+        """
+        try:
+            await page.wait_for_function(
+                f"document.querySelectorAll('{self.copilot_message_selector}').length > {pre_response_msg_count}",
+                timeout=15000,
+            )
+        except Error:
+            current_count = await page.locator(self.copilot_message_selector).count()
+            if current_count <= pre_response_msg_count:
+                logger.error("No new response message appeared within timeout.")
+                return False
+
+        in_progress_markers = (
+            "Generating response",
+            "Searching",
+            "Working on it",
+            "Analyzing",
+        )
+        last_text = ""
+        last_change_time = time.time()
+        end_time = time.time() + timeout_s
+
+        while time.time() < end_time:
+            try:
+                last_msg = page.locator(self.copilot_message_selector).last
+                current_text = await last_msg.inner_text()
+                if last_msg and (
+                    await last_msg.locator(self.copy_button_selector).count() > 0
+                ):
+                    return True
+            except Error:
+                current_text = ""
+
+            if current_text != last_text:
+                last_text = current_text
+                last_change_time = time.time()
+
+            has_in_progress_marker = any(m in last_text for m in in_progress_markers)
+            if (
+                time.time() - last_change_time
+            ) > stability_period_s and not has_in_progress_marker:
+                return True
+
             await asyncio.sleep(0.5)
 
+        logger.warning("Timed out waiting for response to stabilize.")
         return False
 
     async def _extract_latest_response(self, page: Page) -> str:
@@ -491,6 +567,7 @@ class CopilotClient:
             text_input = page.locator(self.text_input_selector)
             await text_input.wait_for(state="visible", timeout=10000)
             await text_input.fill(prompt)
+            await text_input.press("Space")  # Trigger UI listeners
             logger.info(f"Prompt inputted: '{prompt}'")
         except Exception as e:
             raise CopilotClientError(f"Failed to input prompt: {str(e)}")
