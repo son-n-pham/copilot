@@ -531,14 +531,22 @@ class CopilotClient:
             if files_to_upload:
                 logger.info(f"Uploading files: {files_to_upload}")
 
-            # Step 1: Input the prompt into the text box (without sending yet)
+            # Step 1: Upload files if provided, as this action can reset the input field.
+            if files_to_upload and len(files_to_upload) > 0:
+                await self._upload_files_from_copilot_folder(
+                    self.page, files_to_upload
+                )
+                # After the upload, wait for the Send button to become enabled.
+                # This confirms the UI has processed the attached files and is ready.
+                logger.info("Waiting for UI to update after file upload...")
+                await self.page.locator(self.send_button_selector).wait_for(
+                    state="enabled", timeout=15000
+                )
+
+            # Step 2: Input the prompt into the text box.
             await self._input_prompt_only(self.page, prompt)
 
-            # Step 2: Upload files if provided
-            if files_to_upload and len(files_to_upload) > 0:
-                await self._upload_files_from_copilot_folder(self.page, files_to_upload)
-
-            # Step 3: Click the Send button to submit
+            # Step 3: Click the Send button to submit.
             await self._click_send_button(self.page)
 
             # Wait for and extract the response
@@ -566,6 +574,7 @@ class CopilotClient:
         try:
             text_input = page.locator(self.text_input_selector)
             await text_input.wait_for(state="visible", timeout=10000)
+            await text_input.click()  # Focus the input field
             await text_input.fill(prompt)
             await text_input.press("Space")  # Trigger UI listeners
             logger.info(f"Prompt inputted: '{prompt}'")
@@ -574,10 +583,17 @@ class CopilotClient:
 
     # New helper: Click send button
     async def _click_send_button(self, page: Page) -> None:
-        """Click the Send button."""
+        """Click the Send button after ensuring it is enabled."""
         try:
             send_button = page.locator(self.send_button_selector)
             await send_button.wait_for(state="visible", timeout=10000)
+
+            # Check if the button is disabled before clicking
+            if await send_button.is_disabled():
+                raise CopilotClientError(
+                    "Send button is disabled. This may be due to an invalid prompt or login issue."
+                )
+
             await send_button.click()
             logger.info("Send button clicked.")
         except Exception as e:
