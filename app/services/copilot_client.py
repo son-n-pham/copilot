@@ -539,9 +539,22 @@ class CopilotClient:
                 # After the upload, wait for the Send button to become enabled.
                 # This confirms the UI has processed the attached files and is ready.
                 logger.info("Waiting for UI to update after file upload...")
-                await self.page.locator(self.send_button_selector).wait_for(
-                    state="enabled", timeout=15000
-                )
+                send_button = self.page.locator(self.send_button_selector)
+                try:
+                    await send_button.wait_for(timeout=5000)  # Wait for button to be attached
+                    deadline = time.time() + 15  # Wait up to 15 seconds
+                    while time.time() < deadline:
+                        if await send_button.is_enabled():
+                            break
+                        await asyncio.sleep(0.5)
+                    else:
+                        raise CopilotClientError(
+                            "Timed out waiting for Send button to be enabled after file upload."
+                        )
+                except Exception as e:
+                    raise CopilotClientError(
+                        f"Error while waiting for send button to be enabled: {e}"
+                    )
 
             # Step 2: Input the prompt into the text box.
             await self._input_prompt_only(self.page, prompt)
