@@ -778,6 +778,101 @@ def upload_files_from_copilot_folder(page: Page, file_list: list[str]) -> None:
         print(f"[ERROR] Failed to confirm selection: {e}")
 
 
+# Async variant to support integration when using async_playwright Page objects
+async def upload_files_from_copilot_folder_async(page, file_list: list[str]) -> None:
+    """Attach cloud files via the Microsoft 365 Copilot file picker (async version)."""
+
+    # Step 4: Access file upload interface
+    try:
+        print("[INFO] Opening 'Add content and agents' menu…")
+
+        # Click PlusMenuButton
+        plus_button = page.get_by_test_id("PlusMenuButton")
+        await plus_button.wait_for(state="visible", timeout=10000)
+        await plus_button.click()
+
+        # Click Add content
+        add_content = page.get_by_text("Add content")
+        await add_content.wait_for(state="visible", timeout=10000)
+        await add_content.click()
+
+        # Click upload-cloud-file
+        upload_button = page.get_by_test_id("upload-cloud-file")
+        await upload_button.wait_for(state="visible", timeout=10000)
+        await upload_button.click()
+
+    except Error as e:
+        print(f"[ERROR] Couldn't open 'Add content and agents': {e}")
+        return
+
+    # Step 5: Navigate SharePoint/OneDrive file picker (iframe)
+    try:
+        print("[INFO] Waiting for File Picker iframe…")
+        iframe_el = await page.wait_for_selector(
+            'iframe[title="File Picker"]', timeout=30000
+        )
+        frame = await iframe_el.content_frame()
+        if frame is None:
+            print(
+                "[ERROR] File Picker iframe frame not available (content_frame() returned None)."
+            )
+            return
+
+        # Click "My files" if present
+        try:
+            my_files_button = frame.get_by_role("button", name="My files")
+            await my_files_button.wait_for(state="visible", timeout=10000)
+            await my_files_button.click()
+            print("[INFO] Clicked 'My files'.")
+        except Error:
+            # Best-effort: continue if not present
+            print("[DEBUG] 'My files' button not visible; proceeding.")
+
+        # Enter the target folder 'copilot' with exact match
+        try:
+            copilot_link = frame.get_by_role(
+                "link", name=re.compile(r"^copilot$", re.I)
+            )
+            await copilot_link.wait_for(state="visible", timeout=10000)
+            await copilot_link.click()
+            print("[INFO] Entered 'copilot' folder.")
+        except Error as e:
+            print(f"[ERROR] Couldn't enter 'copilot' folder: {e}")
+            return
+
+    except Error as e:
+        print(f"[ERROR] File Picker not available: {e}")
+        return
+
+    # Step 6: Select target files and confirm
+    any_selected = False
+    for file_name in file_list:
+        # Use partial name matching (case-insensitive)
+        pattern = re.compile(re.escape(file_name), re.I)
+        try:
+            # Find checkbox for the file
+            checkbox = frame.get_by_role("checkbox", name=pattern)
+            await checkbox.wait_for(state="visible", timeout=10000)
+            await checkbox.click()
+            print(f"[INFO] Selected file checkbox matching: '{file_name}'.")
+            any_selected = True
+        except Error as e:
+            print(f"[WARN] Could not select file '{file_name}': {e}")
+
+    if not any_selected:
+        print("[ERROR] No files were selected; aborting before clicking 'Select'.")
+        return
+
+    try:
+        # Click the Select button
+        select_button = frame.get_by_role("button", name=re.compile(r"^Select$", re.I))
+        await select_button.wait_for(state="visible", timeout=10000)
+        await select_button.click()
+        print("[INFO] Confirmed selection by clicking 'Select'.")
+    except Error as e:
+        print(f"[ERROR] Failed to confirm selection: {e}")
+
+
 def click_button(page: Page, selector: str, downloads_dir: str | None = None) -> None:
     """Helper to click a button identified by the selector."""
     print(f"[DEBUG] Clicking button with selector '{selector}'")
